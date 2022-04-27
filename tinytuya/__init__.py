@@ -199,7 +199,7 @@ PROTOCOL_VERSION_BYTES_31 = b"3.1"
 PROTOCOL_VERSION_BYTES_33 = b"3.3"
 PROTOCOL_33_HEADER = PROTOCOL_VERSION_BYTES_33 + 12 * b"\x00"
 MESSAGE_HEADER_FMT = ">4I"  # 4*uint32: prefix, seqno, cmd, length
-MESSAGE_RECV_HEADER_FMT = ">5I"  # 4*uint32: prefix, seqno, cmd, length, retcode
+MESSAGE_RECV_HEADER_FMT = ">5I"  # 5*uint32: prefix, seqno, cmd, length, retcode
 MESSAGE_END_FMT = ">2I"  # 2*uint32: crc, suffix
 PREFIX_VALUE = 0x000055AA
 SUFFIX_VALUE = 0x0000AA55
@@ -276,7 +276,9 @@ class AESCipher(object):
         if Crypto:
             cipher = AES.new(self.key, AES.MODE_ECB)
             raw = cipher.decrypt(enc)
-            return self._unpad(raw).decode("utf-8")
+            unpadded = self._unpad(raw)
+            decoded = unpadded.decode("utf-8")
+            return decoded
 
         else:
             cipher = pyaes.blockfeeder.Decrypter(
@@ -292,7 +294,11 @@ class AESCipher(object):
 
     @staticmethod
     def _unpad(s):
-        return s[: -ord(s[len(s) - 1 :])]
+        ret = s
+        o = ord(s[len(s) - 1 :])
+        if o < 16 and s[len(s) - o:] == s[len(s)-1:]*o:
+            ret = s[: -ord(s[len(s) - 1 :])]
+        return ret
 
 
 # Misc Helpers
@@ -351,12 +357,14 @@ def unpack_message(data):
     header_len = struct.calcsize(MESSAGE_RECV_HEADER_FMT)
     end_len = struct.calcsize(MESSAGE_END_FMT)
 
-    _, seqno, cmd, _, retcode = struct.unpack(
+    _, seqno, cmd, payload_len, retcode = struct.unpack(
         MESSAGE_RECV_HEADER_FMT, data[:header_len]
     )
-    payload = data[header_len:-end_len]
-    crc, _ = struct.unpack(MESSAGE_END_FMT, data[-end_len:])
-    return TuyaMessage(seqno, cmd, retcode, payload, crc)
+    payload = data[header_len:header_len + payload_len - 12]
+    # log.debug("decoding crc and suffix from %r", binascii.hexlify(data[header_len + payload_len - 12 : header_len + payload_len]))
+    crc, _ = struct.unpack(MESSAGE_END_FMT, data[header_len + payload_len - 12 : header_len + payload_len - 4])
+    log.debug("seqno=%r, cmd=%r, payload_len=%r, retcode=%r, payload=%r, crc=%r", seqno, cmd, payload_len, retcode, binascii.hexlify(payload), crc)
+    return TuyaMessage(seqno, cmd, retcode, payload, crc), data[header_len + payload_len - 4:]
 
 def has_suffix(payload):
     """Check to see if payload has valid Tuya suffix"""
@@ -643,9 +651,14 @@ class XenonDevice(object):
         # Unpack Message into TuyaMessage format
         # and return payload decrypted
         try:
-            msg = unpack_message(data)
+            msg, leftover = unpack_message(data)
+            while leftover and not msg.payload:
+                log.debug("skipping null response from device")
+                msg, leftover = unpack_message(leftover)
+            while leftover:
+                log.debug("got more responses from device")
+                _, leftover = unpack_message(leftover)
             # Data available: seqno cmd retcode payload crc
-            log.debug("raw unpacked message = %r", msg)
             result = self._decode_payload(msg.payload)
         except:
             log.debug("error unpacking or decoding tuya JSON payload")
@@ -670,6 +683,7 @@ class XenonDevice(object):
             # Received an encrypted payload
             # Remove version header
             payload = payload[len(PROTOCOL_VERSION_BYTES_31) :]
+            log.debug("here")
             # Decrypt payload
             # Remove 16-bytes of MD5 hexdigest of payload
             payload = cipher.decrypt(payload[16:])
@@ -678,13 +692,14 @@ class XenonDevice(object):
             if self.dev_type != "default" or payload.startswith(
                 PROTOCOL_VERSION_BYTES_33
             ):
+                log.debug("removing 3.3=%r", binascii.hexlify(payload))
                 payload = payload[len(PROTOCOL_33_HEADER) :]
-                log.debug("removing 3.3=%r", payload)
+                log.debug("removed 3.3=%r", binascii.hexlify(payload))
             try:
-                log.debug("decrypting=%r", payload)
+                log.debug("decrypting=%r", binascii.hexlify(payload))
                 payload = cipher.decrypt(payload, False)
             except:
-                log.debug("incomplete payload=%r", payload)
+                log.debug("incomplete payload=%r", binascii.hexlify(payload))
                 return None
 
             log.debug("decrypted 3.3 payload=%r", payload)
@@ -923,9 +938,11 @@ class XenonDevice(object):
             self.cipher = AESCipher(self.local_key)
             payload = self.cipher.encrypt(payload, False)
             self.cipher = None
+            log.debug("payload encrypted=%r",binascii.hexlify(payload))
             if command_hb != "0a" and command_hb != "12":
                 # add the 3.3 header
                 payload = PROTOCOL_33_HEADER + payload
+            log.debug("payload prefixed=%r",binascii.hexlify(payload))
         elif command == CONTROL:
             # need to encrypt
             self.cipher = AESCipher(self.local_key)
@@ -948,6 +965,7 @@ class XenonDevice(object):
                 + payload
             )
             self.cipher = None
+
 
         # create Tuya message packet
         msg = TuyaMessage(self.seqno, int(command_hb, 16), 0, payload, 0)
